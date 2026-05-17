@@ -1,0 +1,439 @@
+//@version=6
+indicator("Dynamic Time-Price Fibonacci Corridor", shorttitle="DTPFC", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ============================================================================
+// I. CONSTANTS
+// ============================================================================
+
+MODEL_A = "A: Pure Time Proportions"
+MODEL_B = "B: Historical Sampling"
+MODEL_C = "C: Volatility (ATR)"
+
+// Fibonacci retracement levels bounding the three target zones.
+FIB_Z1_LO = 0.382
+FIB_Z1_HI = 0.500
+FIB_Z2_LO = 0.500
+FIB_Z2_HI = 0.618
+FIB_Z3_LO = 0.618
+FIB_Z3_HI = 0.786
+
+// Model A time-window multipliers (fractions of impulse duration dT).
+TA_Z1_LO = 0.236
+TA_Z1_HI = 0.382
+TA_Z2_LO = 0.382
+TA_Z2_HI = 0.500
+TA_Z3_LO = 0.500
+TA_Z3_HI = 0.618
+
+// ============================================================================
+// II. USER INPUTS
+// ============================================================================
+
+// Single visible setting at the top of the dialog.
+model = input.string(MODEL_A, "Calculation model", options=[MODEL_A, MODEL_B, MODEL_C], tooltip="A: time-window from impulse duration (geometric).\nB: time-window from historical mean ± stdev of τ per zone.\nC: time-window from expected bars = ΔP / ATR.\nProbabilities are always the historical win-rate from the auto-detected pivot sample (same direction as the current impulse).")
+
+// --- Current impulse ------------------------------------------------------
+// By default, the script uses the latest auto-detected pivot impulse as the
+// "current" impulse. Toggle override to specify it manually with bar offsets.
+manualOverride = input.bool(false, "Override with manual impulse", group="Current impulse", tooltip="When OFF (default): the latest auto-detected pivot impulse is used as the current one — zero manual interaction.\nWhen ON: the manual bar-offset fields below define Start and End. To re-pick, just edit the integers in Settings and click OK; no chart clicks needed.")
+startBarsAgo  = input.int(200, "Manual Start — N bars ago", minval=2, maxval=4999, group="Current impulse", tooltip="Position of the impulse Start, counted in bars back from the latest bar.")
+startUseHigh  = input.bool(false, "Manual Start uses HIGH (else LOW)", group="Current impulse")
+endBarsAgo    = input.int(0,   "Manual End — N bars ago",   minval=0, maxval=4998, group="Current impulse", tooltip="Position of the impulse End. Must be smaller than Start.")
+endUseHigh    = input.bool(true,  "Manual End uses HIGH (else LOW)", group="Current impulse")
+
+// --- Auto-historical pivot scan ------------------------------------------
+pivLeft    = input.int(10, "Pivot left bars",  minval=1, maxval=200, group="Auto history", tooltip="Bars left of a candle required for it to count as a swing pivot.")
+pivRight   = input.int(10, "Pivot right bars", minval=1, maxval=200, group="Auto history", tooltip="Bars right of a candle required to confirm a pivot. This is the confirmation lag.")
+minSamples = input.int(3,  "Minimum same-direction samples", minval=1, maxval=1000, group="Auto history", tooltip="If fewer settled same-direction historical impulses exist, the stats panel shows 'Insufficient data'.")
+
+// --- Model C settings ----------------------------------------------------
+atrLen = input.int(14, "Model C — ATR length", minval=1, maxval=500, group="Model C")
+
+// --- Display -------------------------------------------------------------
+panelCorner = input.string("Top Right", "Stats panel position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group="Display")
+boxOpacity  = input.int(75, "Box transparency (0=solid, 95=near-invisible)", minval=0, maxval=95, group="Display")
+showHist    = input.bool(false, "Draw retroactive boxes on historical impulses", group="Display")
+col_z1      = input.color(color.green,  "Zone 1 colour (0.382–0.5)",   group="Display")
+col_z2      = input.color(color.yellow, "Zone 2 colour (0.5–0.618)",   group="Display")
+col_z3      = input.color(color.red,    "Zone 3 colour (0.618–0.786)", group="Display")
+
+// ============================================================================
+// III. TYPES AND PERSISTENT STATE
+// ============================================================================
+
+// One historical impulse detected from alternating pivots.
+type Impulse
+    int   t0          = 0
+    float p0          = 0.0
+    int   t1          = 0
+    float p1          = 0.0
+    bool  is_up       = false
+    bool  hit_z1      = false
+    bool  hit_z2      = false
+    bool  hit_z3      = false
+    int   tau_z1      = 0
+    int   tau_z2      = 0
+    int   tau_z3      = 0
+    bool  invalidated = false
+    bool  settled     = false
+
+var array<Impulse> impulses = array.new<Impulse>()
+
+// Last confirmed pivot. is_high == true means swing high.
+var int   lp_time    = 0
+var float lp_price   = 0.0
+var bool  lp_is_high = false
+var int   lp_count   = 0
+
+// Persistent handles for drawings so we can wipe them each redraw.
+var array<box>   draw_boxes  = array.new<box>()
+var array<line>  draw_lines  = array.new<line>()
+var array<label> draw_labels = array.new<label>()
+var table        stats_tbl   = na
+
+
+// ============================================================================
+// IV. HELPER FUNCTIONS
+// ============================================================================
+
+// Direction-agnostic [low, high] price bounds of a Fib zone.
+zone_bounds(float p0, float p1, float frac_lo, float frac_hi) =>
+    a = p1 - frac_lo * (p1 - p0)
+    b = p1 - frac_hi * (p1 - p0)
+    [math.min(a, b), math.max(a, b)]
+
+// Standard normal CDF — Abramowitz & Stegun 26.2.17 (max abs err ~7.5e-8).
+norm_cdf(float z) =>
+    az = math.abs(z)
+    t  = 1.0 / (1.0 + 0.2316419 * az)
+    d  = 0.3989422804014327 * math.exp(-az * az * 0.5)
+    poly = 0.319381530 * t + (-0.356563782) * t * t + 1.781477937 * t * t * t + (-1.821255978) * t * t * t * t + 1.330274429 * t * t * t * t * t
+    p = 1.0 - d * poly
+    z >= 0 ? p : 1.0 - p
+
+// Format a millisecond duration as a short human-readable string.
+fmt_duration(int ms) =>
+    abs_ms = math.abs(ms)
+    days   = math.floor(abs_ms / 86400000)
+    hours  = math.floor((abs_ms % 86400000) / 3600000)
+    mins   = math.floor((abs_ms % 3600000) / 60000)
+    days > 0 ? str.tostring(days) + "d " + str.tostring(hours) + "h" : hours > 0 ? str.tostring(hours) + "h " + str.tostring(mins) + "m" : str.tostring(mins) + "m"
+
+// Translate panel-corner string into a Pine position constant.
+panel_pos(string s) =>
+    s == "Top Left" ? position.top_left : s == "Top Right" ? position.top_right : s == "Bottom Left" ? position.bottom_left : position.bottom_right
+
+// Draw a Fib-zone prediction box and its win-rate label.
+// Globals it mutates: draw_boxes, draw_labels. Globals it reads: boxOpacity.
+draw_zone_box(int x_from, int x_to, float y_lo, float y_hi, color base_col, float win_rate, bool data_ok) =>
+    bc  = color.new(base_col, boxOpacity)
+    bb  = box.new(x_from, y_hi, x_to, y_lo, xloc=xloc.bar_time, bgcolor=bc, border_color=color.new(base_col, 30), border_width=1)
+    array.push(draw_boxes, bb)
+    txt = data_ok ? str.tostring(math.round(win_rate * 100.0)) + "%" : "—"
+    lab = label.new(int((x_from + x_to) / 2), (y_hi + y_lo) * 0.5, txt, xloc=xloc.bar_time, style=label.style_none, textcolor=color.white, size=size.normal)
+    array.push(draw_labels, lab)
+
+// Apply one bar's high/low/time to an unsettled impulse.
+update_impulse(Impulse imp, float hi, float lo, int tt) =>
+    if not imp.settled
+        tau = tt - imp.t1
+        if not imp.invalidated
+            broken = (imp.is_up and hi > imp.p1) or ((not imp.is_up) and lo < imp.p1)
+            if broken
+                imp.invalidated := true
+        if not imp.invalidated
+            [z1_lo, z1_hi] = zone_bounds(imp.p0, imp.p1, FIB_Z1_LO, FIB_Z1_HI)
+            [z2_lo, z2_hi] = zone_bounds(imp.p0, imp.p1, FIB_Z2_LO, FIB_Z2_HI)
+            [z3_lo, z3_hi] = zone_bounds(imp.p0, imp.p1, FIB_Z3_LO, FIB_Z3_HI)
+            if not imp.hit_z1 and hi >= z1_lo and lo <= z1_hi
+                imp.hit_z1 := true
+                imp.tau_z1 := tau
+            if not imp.hit_z2 and hi >= z2_lo and lo <= z2_hi
+                imp.hit_z2 := true
+                imp.tau_z2 := tau
+            if not imp.hit_z3 and hi >= z3_lo and lo <= z3_hi
+                imp.hit_z3 := true
+                imp.tau_z3 := tau
+
+// ============================================================================
+// V. PER-BAR PIVOT DETECTION AND IMPULSE TRACKING
+// ============================================================================
+
+ph = ta.pivothigh(pivLeft, pivRight)
+pl = ta.pivotlow (pivLeft, pivRight)
+atr = ta.atr(atrLen)
+
+// At the moment a pivot fires, its true location is `pivRight` bars ago.
+new_high = not na(ph)
+new_low  = not na(pl)
+
+if new_high or new_low
+    piv_price   = new_high ? ph : pl
+    piv_is_high = new_high
+    piv_time    = time[pivRight]
+
+    if lp_count == 0
+        // First pivot — just record it.
+        lp_time    := piv_time
+        lp_price   := piv_price
+        lp_is_high := piv_is_high
+        lp_count   := 1
+    else if lp_is_high == piv_is_high
+        // Same direction — keep the more extreme of the two as the working pivot.
+        if (piv_is_high and piv_price > lp_price) or ((not piv_is_high) and piv_price < lp_price)
+            lp_time  := piv_time
+            lp_price := piv_price
+    else
+        // Alternating direction — a complete impulse (lp -> current pivot) is born.
+        // The previous impulse (if any) is now settled because its evaluation
+        // window has effectively ended.
+        if array.size(impulses) > 0
+            prev = array.get(impulses, array.size(impulses) - 1)
+            prev.settled := true
+
+        imp = Impulse.new()
+        imp.t0    := lp_time
+        imp.p0    := lp_price
+        imp.t1    := piv_time
+        imp.p1    := piv_price
+        imp.is_up := piv_price > lp_price
+        array.push(impulses, imp)
+
+        // Catch up the new impulse for the lag bars [pivRight-1 .. 1]. The
+        // current bar (offset 0) is handled by the per-bar update below.
+        if pivRight > 1
+            for k = pivRight - 1 to 1
+                update_impulse(imp, high[k], low[k], time[k])
+
+        lp_time    := piv_time
+        lp_price   := piv_price
+        lp_is_high := piv_is_high
+        lp_count   += 1
+
+// Per-bar update of the currently active (most recent, unsettled) impulse.
+if array.size(impulses) > 0
+    cur = array.get(impulses, array.size(impulses) - 1)
+    if not cur.settled
+        update_impulse(cur, high, low, time)
+
+// ============================================================================
+// VI. LAST-BAR AGGREGATION AND DRAWING
+// ============================================================================
+
+clear_drawings() =>
+    if array.size(draw_boxes) > 0
+        for b in draw_boxes
+            box.delete(b)
+        array.clear(draw_boxes)
+    if array.size(draw_lines) > 0
+        for ln in draw_lines
+            line.delete(ln)
+        array.clear(draw_lines)
+    if array.size(draw_labels) > 0
+        for lb in draw_labels
+            label.delete(lb)
+        array.clear(draw_labels)
+
+// Resolve the "current impulse" source. In auto mode it is the latest
+// auto-detected (unsettled) impulse; in manual mode it is built from the
+// user's bar-offset inputs.
+int   src_t0     = 0
+float src_p0     = 0.0
+int   src_t1     = 0
+float src_p1     = 0.0
+bool  src_is_up  = false
+bool  src_valid  = false
+// Reason code for the panel when src is not valid:
+//   0 = valid; 1 = manual offsets invalid; 2 = no auto impulses yet.
+int   src_reason = 0
+
+if barstate.islast
+    if manualOverride
+        if startBarsAgo > endBarsAgo and bar_index >= startBarsAgo
+            src_t0    := time[startBarsAgo]
+            src_p0    := startUseHigh ? high[startBarsAgo] : low[startBarsAgo]
+            src_t1    := time[endBarsAgo]
+            src_p1    := endUseHigh  ? high[endBarsAgo]    : low[endBarsAgo]
+            src_is_up := src_p1 > src_p0
+            src_valid := src_p0 != src_p1
+            src_reason := src_valid ? 0 : 1
+        else
+            src_reason := 1
+    else
+        if array.size(impulses) > 0
+            li = array.get(impulses, array.size(impulses) - 1)
+            src_t0    := li.t0
+            src_p0    := li.p0
+            src_t1    := li.t1
+            src_p1    := li.p1
+            src_is_up := li.is_up
+            src_valid := true
+        else
+            src_reason := 2
+
+if barstate.islast
+    clear_drawings()
+
+    // ----- Aggregate same-direction historical sample -----------------------
+    int n_total = 0
+    int n_z1    = 0
+    int n_z2    = 0
+    int n_z3    = 0
+    float sum_t1 = 0.0
+    float sum_t2 = 0.0
+    float sum_t3 = 0.0
+    float sq_t1  = 0.0
+    float sq_t2  = 0.0
+    float sq_t3  = 0.0
+
+    if src_valid and array.size(impulses) > 0
+        for i = 0 to array.size(impulses) - 1
+            imp = array.get(impulses, i)
+            // The latest auto-impulse is always unsettled, so filtering on
+            // `settled` already excludes it from the sample in auto mode.
+            if imp.settled and imp.is_up == src_is_up
+                n_total += 1
+                if imp.hit_z1
+                    n_z1   += 1
+                    sum_t1 += imp.tau_z1
+                    sq_t1  += imp.tau_z1 * imp.tau_z1
+                if imp.hit_z2
+                    n_z2   += 1
+                    sum_t2 += imp.tau_z2
+                    sq_t2  += imp.tau_z2 * imp.tau_z2
+                if imp.hit_z3
+                    n_z3   += 1
+                    sum_t3 += imp.tau_z3
+                    sq_t3  += imp.tau_z3 * imp.tau_z3
+
+    enough = n_total >= minSamples
+    wr_z1  = n_total > 0 ? n_z1 / float(n_total) : 0.0
+    wr_z2  = n_total > 0 ? n_z2 / float(n_total) : 0.0
+    wr_z3  = n_total > 0 ? n_z3 / float(n_total) : 0.0
+    avg_t1 = n_z1 > 0 ? sum_t1 / n_z1 : 0.0
+    avg_t2 = n_z2 > 0 ? sum_t2 / n_z2 : 0.0
+    avg_t3 = n_z3 > 0 ? sum_t3 / n_z3 : 0.0
+    sd_t1  = n_z1 > 1 ? math.sqrt(math.max(0.0, sq_t1 / n_z1 - avg_t1 * avg_t1)) : 0.0
+    sd_t2  = n_z2 > 1 ? math.sqrt(math.max(0.0, sq_t2 / n_z2 - avg_t2 * avg_t2)) : 0.0
+    sd_t3  = n_z3 > 1 ? math.sqrt(math.max(0.0, sq_t3 / n_z3 - avg_t3 * avg_t3)) : 0.0
+
+    // ----- Draw current impulse + prediction boxes --------------------------
+    if src_valid
+        src_dT = src_t1 - src_t0
+        // Impulse line
+        ln = line.new(src_t0, src_p0, src_t1, src_p1, xloc=xloc.bar_time, color=color.new(color.white, 0), width=2)
+        array.push(draw_lines, ln)
+        lb0 = label.new(src_t0, src_p0, "Start", xloc=xloc.bar_time, style=src_is_up ? label.style_label_up : label.style_label_down, color=color.new(color.gray, 50), textcolor=color.white, size=size.small)
+        lb1 = label.new(src_t1, src_p1, "End",   xloc=xloc.bar_time, style=src_is_up ? label.style_label_down : label.style_label_up, color=color.new(color.gray, 50), textcolor=color.white, size=size.small)
+        array.push(draw_labels, lb0)
+        array.push(draw_labels, lb1)
+
+        // Zone price bounds (direction-agnostic).
+        [pz1_lo, pz1_hi] = zone_bounds(src_p0, src_p1, FIB_Z1_LO, FIB_Z1_HI)
+        [pz2_lo, pz2_hi] = zone_bounds(src_p0, src_p1, FIB_Z2_LO, FIB_Z2_HI)
+        [pz3_lo, pz3_hi] = zone_bounds(src_p0, src_p1, FIB_Z3_LO, FIB_Z3_HI)
+
+        // Bar duration in ms (for Model C time conversion).
+        bar_ms = timeframe.in_seconds(timeframe.period) * 1000
+
+        // Per-zone time windows (start_ms, end_ms) relative to src_t1.
+        float w_lo_1 = 0.0
+        float w_hi_1 = 0.0
+        float w_lo_2 = 0.0
+        float w_hi_2 = 0.0
+        float w_lo_3 = 0.0
+        float w_hi_3 = 0.0
+
+        if model == MODEL_A
+            w_lo_1 := src_dT * TA_Z1_LO
+            w_hi_1 := src_dT * TA_Z1_HI
+            w_lo_2 := src_dT * TA_Z2_LO
+            w_hi_2 := src_dT * TA_Z2_HI
+            w_lo_3 := src_dT * TA_Z3_LO
+            w_hi_3 := src_dT * TA_Z3_HI
+        else if model == MODEL_B
+            w_lo_1 := math.max(0.0, avg_t1 - sd_t1)
+            w_hi_1 := avg_t1 + sd_t1
+            w_lo_2 := math.max(0.0, avg_t2 - sd_t2)
+            w_hi_2 := avg_t2 + sd_t2
+            w_lo_3 := math.max(0.0, avg_t3 - sd_t3)
+            w_hi_3 := avg_t3 + sd_t3
+        else
+            // Model C — expected bars = ΔP_to_zone_centre / ATR; window = ±√n.
+            atr_safe = atr > 0 ? atr : syminfo.mintick
+            dp1 = math.abs(((pz1_lo + pz1_hi) * 0.5) - src_p1)
+            dp2 = math.abs(((pz2_lo + pz2_hi) * 0.5) - src_p1)
+            dp3 = math.abs(((pz3_lo + pz3_hi) * 0.5) - src_p1)
+            n1 = dp1 / atr_safe
+            n2 = dp2 / atr_safe
+            n3 = dp3 / atr_safe
+            w_lo_1 := math.max(0.0, n1 - math.sqrt(n1)) * bar_ms
+            w_hi_1 := (n1 + math.sqrt(n1)) * bar_ms
+            w_lo_2 := math.max(0.0, n2 - math.sqrt(n2)) * bar_ms
+            w_hi_2 := (n2 + math.sqrt(n2)) * bar_ms
+            w_lo_3 := math.max(0.0, n3 - math.sqrt(n3)) * bar_ms
+            w_hi_3 := (n3 + math.sqrt(n3)) * bar_ms
+
+        x1_lo = src_t1 + int(w_lo_1)
+        x1_hi = src_t1 + int(w_hi_1)
+        x2_lo = src_t1 + int(w_lo_2)
+        x2_hi = src_t1 + int(w_hi_2)
+        x3_lo = src_t1 + int(w_lo_3)
+        x3_hi = src_t1 + int(w_hi_3)
+
+        draw_zone_box(x1_lo, x1_hi, pz1_lo, pz1_hi, col_z1, wr_z1, enough)
+        draw_zone_box(x2_lo, x2_hi, pz2_lo, pz2_hi, col_z2, wr_z2, enough)
+        draw_zone_box(x3_lo, x3_hi, pz3_lo, pz3_hi, col_z3, wr_z3, enough)
+
+        // ----- Retroactive boxes on historical same-direction impulses ------
+        if showHist and array.size(impulses) > 0
+            for i = 0 to array.size(impulses) - 1
+                imp = array.get(impulses, i)
+                if imp.settled and imp.is_up == src_is_up
+                    [hz1_lo, hz1_hi] = zone_bounds(imp.p0, imp.p1, FIB_Z1_LO, FIB_Z1_HI)
+                    [hz2_lo, hz2_hi] = zone_bounds(imp.p0, imp.p1, FIB_Z2_LO, FIB_Z2_HI)
+                    [hz3_lo, hz3_hi] = zone_bounds(imp.p0, imp.p1, FIB_Z3_LO, FIB_Z3_HI)
+                    h_dT = imp.t1 - imp.t0
+                    hb1 = box.new(imp.t1 + int(h_dT * TA_Z1_LO), hz1_hi, imp.t1 + int(h_dT * TA_Z1_HI), hz1_lo, xloc=xloc.bar_time, bgcolor=color.new(col_z1, 90), border_color=imp.hit_z1 ? color.new(color.green, 0) : imp.invalidated ? color.new(color.red, 0) : color.new(color.gray, 60), border_style=imp.hit_z1 ? line.style_solid : line.style_dashed, border_width=1)
+                    hb2 = box.new(imp.t1 + int(h_dT * TA_Z2_LO), hz2_hi, imp.t1 + int(h_dT * TA_Z2_HI), hz2_lo, xloc=xloc.bar_time, bgcolor=color.new(col_z2, 90), border_color=imp.hit_z2 ? color.new(color.green, 0) : imp.invalidated ? color.new(color.red, 0) : color.new(color.gray, 60), border_style=imp.hit_z2 ? line.style_solid : line.style_dashed, border_width=1)
+                    hb3 = box.new(imp.t1 + int(h_dT * TA_Z3_LO), hz3_hi, imp.t1 + int(h_dT * TA_Z3_HI), hz3_lo, xloc=xloc.bar_time, bgcolor=color.new(col_z3, 90), border_color=imp.hit_z3 ? color.new(color.green, 0) : imp.invalidated ? color.new(color.red, 0) : color.new(color.gray, 60), border_style=imp.hit_z3 ? line.style_solid : line.style_dashed, border_width=1)
+                    array.push(draw_boxes, hb1)
+                    array.push(draw_boxes, hb2)
+                    array.push(draw_boxes, hb3)
+
+    // ----- Stats table ------------------------------------------------------
+    if not na(stats_tbl)
+        table.delete(stats_tbl)
+    stats_tbl := table.new(panel_pos(panelCorner), 4, 5, bgcolor=color.new(color.black, 20), border_color=color.new(color.gray, 50), border_width=1)
+
+    table.cell(stats_tbl, 0, 0, "DTPFC — " + (model == MODEL_A ? "Model A" : model == MODEL_B ? "Model B" : "Model C"), text_color=color.white, bgcolor=color.new(color.gray, 60), text_size=size.small)
+    table.merge_cells(stats_tbl, 0, 0, 3, 0)
+
+    if not src_valid
+        msg = src_reason == 1 ? "Manual override invalid — set Start > End and within chart history (Settings → Current impulse)." : src_reason == 2 ? "No auto-detected impulses yet — decrease Pivot bars in Settings or enable manual override." : "No current impulse."
+        table.cell(stats_tbl, 0, 1, msg, text_color=color.yellow, text_size=size.small)
+        table.merge_cells(stats_tbl, 0, 1, 3, 1)
+    else if not enough
+        table.cell(stats_tbl, 0, 1, "Insufficient data: " + str.tostring(n_total) + "/" + str.tostring(minSamples) + " same-direction samples.", text_color=color.yellow, text_size=size.small)
+        table.merge_cells(stats_tbl, 0, 1, 3, 1)
+    else
+        table.cell(stats_tbl, 0, 1, "Zone",       text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+        table.cell(stats_tbl, 1, 1, "Win-rate",   text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+        table.cell(stats_tbl, 2, 1, "Avg τ",      text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+        table.cell(stats_tbl, 3, 1, "Samples",    text_color=color.white, bgcolor=color.new(color.gray, 70), text_size=size.small)
+
+        table.cell(stats_tbl, 0, 2, "Z1 0.382–0.5",   text_color=color.white, bgcolor=color.new(col_z1, 70), text_size=size.small)
+        table.cell(stats_tbl, 1, 2, str.tostring(math.round(wr_z1 * 100.0)) + "%", text_color=color.white, text_size=size.small)
+        table.cell(stats_tbl, 2, 2, n_z1 > 0 ? fmt_duration(int(avg_t1)) : "—",    text_color=color.white, text_size=size.small)
+        table.cell(stats_tbl, 3, 2, str.tostring(n_z1) + "/" + str.tostring(n_total), text_color=color.white, text_size=size.small)
+
+        table.cell(stats_tbl, 0, 3, "Z2 0.5–0.618", text_color=color.white, bgcolor=color.new(col_z2, 70), text_size=size.small)
+        table.cell(stats_tbl, 1, 3, str.tostring(math.round(wr_z2 * 100.0)) + "%", text_color=color.white, text_size=size.small)
+        table.cell(stats_tbl, 2, 3, n_z2 > 0 ? fmt_duration(int(avg_t2)) : "—",    text_color=color.white, text_size=size.small)
+        table.cell(stats_tbl, 3, 3, str.tostring(n_z2) + "/" + str.tostring(n_total), text_color=color.white, text_size=size.small)
+
+        table.cell(stats_tbl, 0, 4, "Z3 0.618–0.786", text_color=color.white, bgcolor=color.new(col_z3, 70), text_size=size.small)
+        table.cell(stats_tbl, 1, 4, str.tostring(math.round(wr_z3 * 100.0)) + "%", text_color=color.white, text_size=size.small)
+        table.cell(stats_tbl, 2, 4, n_z3 > 0 ? fmt_duration(int(avg_t3)) : "—",    text_color=color.white, text_size=size.small)
+        table.cell(stats_tbl, 3, 4, str.tostring(n_z3) + "/" + str.tostring(n_total), text_color=color.white, text_size=size.small)
+
