@@ -1,69 +1,78 @@
-# Dynamic Time-Price Fibonacci Corridor (DTPFC)
+Dynamic Time-Price Fibonacci Corridor (DTPFC)
 
 A Pine Script v6 indicator for TradingView that turns historical price action
-into probabilistic Fibonacci targets in **both price and time**.
+into probabilistic Fibonacci targets in both price and time.
 
 For every detected price impulse the script draws six forward-looking boxes:
+four retracement zones Z1–Z4 covering 0.382–0.5, 0.5–0.618, 0.618–0.786 and
+0.786–1.0, and two extension (breakout) zones B1–B2 at 1.0–1.272 and
+1.272–1.618.
 
-- **Z1–Z4** — retracement zones at `0.382–0.5`, `0.5–0.618`, `0.618–0.786`, `0.786–1.0`
-- **B1–B2** — extension (breakout) zones at `1.0–1.272`, `1.272–1.618`
-
-Each box is positioned in time at the **average ± 1σ** delay at which similar
+Each box is positioned in time at the average ± 1σ delay at which similar
 historical impulses first reached that zone, and labelled with the empirical
-**hit-rate** for that zone.
+hit-rate for that zone.
 
-## How it works
+How it works
 
-1. **Impulse detection.** Confirmed pivots (`ta.pivothigh` / `ta.pivotlow`) split
-   the chart into directional impulses (low → high = up-impulse, etc.).
-2. **Tentative end.** Pivots are confirmed `pivRight` bars late. To reveal the
-   prediction earlier, the script declares an impulse end *tentatively* as soon
-   as price retraces from the running extremum by `tentativeMult × ATR`. The
-   prediction is drawn in **yellow** while tentative and turns **white** once
-   the pivot confirms.
-3. **Sample selection.** Only **same-direction** historical impulses count.
-   Optional filters narrow the sample to those with comparable `|ΔP|` and/or
-   duration relative to the current impulse.
-4. **Statistics.** For each historical impulse, the script checks within a
-   user-defined `lookforwardBars` window whether price entered each zone, and
-   how many bars it took. These are aggregated into hit-rates and time windows.
+Confirmed pivots from ta.pivothigh and ta.pivotlow split the chart into
+directional impulses (low to high is an up-impulse, high to low is a
+down-impulse). Pivots are confirmed pivRight bars late, so to reveal the
+prediction earlier the script declares an impulse end tentatively as soon as
+price retraces from the running extremum by tentativeMult × ATR. The
+prediction is drawn in yellow while tentative and turns white once the pivot
+confirms.
 
-## Settings
+Only same-direction historical impulses count toward the statistics. Optional
+filters narrow the sample to those with comparable absolute price range and
+duration relative to the current impulse. For each historical impulse the
+script checks within a user-defined lookforward window whether price entered
+each zone, and how many bars it took. These observations are aggregated into
+hit-rates and time windows.
 
-| Group | Key inputs |
-|---|---|
-| **Current impulse** | `Override with manual impulse`, `Manual Start time`, `Manual End time` (timestamps — bars do not drift) |
-| **Detection** | `Pivot left/right bars`, `Tentative end — ATR retracement`, `ATR length` |
-| **Statistics** | `Lookforward window (bars)`, `Filter history by impulse size`, `Filter history by impulse duration`, `Max historical impulses to keep` |
-| **Display** | Panel position, box transparency, historical-impulse lines and zones, per-zone colours |
+Settings
 
-## Reading the chart
+Current impulse — override with manual impulse, manual start time, manual end
+time. Timestamps anchor the impulse to fixed bars; new bars do not shift the
+selection.
 
-- **White / yellow line** — current impulse (yellow = tentative end).
-- **Coloured boxes** — predicted zones; box height = price range, box width =
-  historical time window, label = hit-rate.
-- **Thin coloured lines** (optional) — historical same-direction impulses used
-  in the statistics: green = touched at least one retracement zone, red =
-  invalidated past start, gray = neither.
-- **Stats table** — per-zone hit-rate, average τ to first touch, sample count,
-  plus an `Invalidated` row (share of impulses that broke past their start).
+Detection — pivot left/right bars, tentative end ATR retracement multiplier,
+ATR length.
 
-## Manual mode
+Statistics — lookforward window in bars, filter history by impulse size,
+filter history by impulse duration, max historical impulses to keep.
 
-Toggle `Override with manual impulse` and set the two timestamps to pin the
-impulse to specific bars. Direction is inferred from the close-to-close change
-between those two bars. Timestamps anchor the impulse to a fixed point in
-history — new bars do not shift the selection.
+Display — panel position, box transparency, toggles for historical-impulse
+lines and retroactive zone boxes, per-zone colours.
 
-## Requirements
+Reading the chart
 
-- TradingView Pine Script **v6**.
-- `max_bars_back = 5000` (built-in).
+The current impulse is a thick line: yellow while the end is tentative, white
+once the opposite pivot has confirmed it. Coloured boxes are the predicted
+zones — box height covers the price range, box width covers the historical
+time window, and the label inside shows the hit-rate.
 
-## Files
+Thin coloured lines (optional) are the historical same-direction impulses used
+in the statistics. Green means the impulse touched at least one retracement
+zone, red means it was invalidated past its own start, gray means neither.
 
-- `dynamic_time_price_fib_corridor.pine` — the indicator source.
+The stats table lists, for each zone, the hit-rate, the average time to first
+touch, and the sample count, plus an Invalidated row showing the share of
+impulses that broke past their start.
 
-## License
+Manual mode
+
+Toggle override with manual impulse and set the two timestamps to pin the
+impulse to specific bars. Direction is inferred from the close-to-close
+change between those two bars.
+
+Requirements
+
+TradingView Pine Script v6. The script declares max_bars_back = 5000.
+
+Files
+
+dynamic_time_price_fib_corridor.pine — the indicator source.
+
+License
 
 MIT.
